@@ -19,6 +19,48 @@ def has_any_digit(token: str) -> bool:
     return any(ch.isdigit() for ch in token)
 
 
+def first_visible_char(text: str) -> str:
+    for ch in text:
+        if not ch.isspace():
+            return ch
+    return ""
+
+
+def update_run_state(last_char: str, run_len: int, fragment: str) -> tuple[str, int]:
+    # 按生成后的可见字符更新“连续重复字符”状态。
+    # 空白字符会打断连续计数。
+    for ch in fragment:
+        if ch.isspace():
+            last_char = ""
+            run_len = 0
+            continue
+        if ch == last_char:
+            run_len += 1
+        else:
+            last_char = ch
+            run_len = 1
+    return last_char, run_len
+
+
+def max_visible_run(text: str) -> int:
+    max_run = 0
+    prev = ""
+    cur = 0
+    for ch in text:
+        if ch.isspace():
+            prev = ""
+            cur = 0
+            continue
+        if ch == prev:
+            cur += 1
+        else:
+            prev = ch
+            cur = 1
+        if cur > max_run:
+            max_run = cur
+    return max_run
+
+
 def build_weighted_prior_and_mask(
     tokenizer: AutoTokenizer, vocab_size: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -32,8 +74,9 @@ def build_weighted_prior_and_mask(
     for token_id in range(vocab_size):
         token = tokenizer.convert_ids_to_tokens(token_id) or ""
         token_clean = token.replace("Ġ", "").replace("Ċ", "").replace("ĉ", "").strip()
+        token_decoded = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
 
-        if has_any_digit(token_clean):
+        if has_any_digit(token_clean) or has_any_digit(token_decoded):
             weight = 0.0
         elif ASCII_LETTER_RE.search(token_clean):
             weight = 0.0
@@ -52,6 +95,48 @@ def build_weighted_prior_and_mask(
     prior = weights.unsqueeze(0)
     prior = prior / prior.sum(dim=-1, keepdim=True)
     return prior, allowed_mask
+
+
+def build_repeat_start_index(
+    tokenizer: AutoTokenizer, vocab_size: int, device: str
+) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    # 预先建立“token 首个可见字符 -> token id 列表”，
+    # 便于在生成时高效施加连续字符惩罚。
+    char_to_ids: dict[str, list[int]] = {}
+    char_to_prefix_runs: dict[str, list[int]] = {}
+    token_run_penalty = torch.ones(vocab_size, dtype=torch.float32, device=device)
+    for token_id in range(vocab_size):
+        token_text = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
+        text = token_text.lstrip()
+        if not text:
+            continue
+
+        ch = text[0]
+        prefix_run = 1
+        while prefix_run < len(text) and text[prefix_run] == ch:
+            prefix_run += 1
+
+        char_to_ids.setdefault(ch, []).append(token_id)
+        char_to_prefix_runs.setdefault(ch, []).append(prefix_run)
+
+        token_max_run = max_visible_run(text)
+        if token_max_run >= 8:
+            token_run_penalty[token_id] = 0.0
+        elif token_max_run >= 6:
+            token_run_penalty[token_id] = 0.005
+        elif token_max_run == 5:
+            token_run_penalty[token_id] = 0.04
+        elif token_max_run == 4:
+            token_run_penalty[token_id] = 0.15
+
+    repeat_start_meta = {
+        ch: (
+            torch.tensor(ids, dtype=torch.long, device=device),
+            torch.tensor(char_to_prefix_runs[ch], dtype=torch.long, device=device),
+        )
+        for ch, ids in char_to_ids.items()
+    }
+    return repeat_start_meta, token_run_penalty.unsqueeze(0)
 
 
 # =========================
@@ -112,9 +197,19 @@ collapse_steps = max(1, collapse_reach_steps - collapse_warmup_steps)
 
 temperature = 1.0
 
+# 连续字符惩罚：当同一字符连续出现过长时，显著降低“继续同字符”的概率。
+repeat_penalty_start = 3
+repeat_penalty_base = 0.06
+repeat_hard_block_start = 6
+
 entropy_values = []
 vocab_size = model.get_output_embeddings().weight.size(0)
 uniform_prior, allowed_mask = build_weighted_prior_and_mask(tokenizer, vocab_size, device)
+repeat_start_meta, token_run_penalty = build_repeat_start_index(
+    tokenizer, vocab_size, device
+)
+last_char = ""
+last_char_run_len = 0
 
 # =========================
 # 生成循环
@@ -135,6 +230,23 @@ with torch.no_grad():
 
         # 最终分布整体约束到允许集合，避免生成中混入英文词。
         mixed_probs = mixed_probs * allowed_mask
+        mixed_probs = mixed_probs * token_run_penalty
+
+        if last_char_run_len >= repeat_penalty_start and last_char in repeat_start_meta:
+            penalty_ids, prefix_runs = repeat_start_meta[last_char]
+            projected_runs = last_char_run_len + prefix_runs
+
+            hard_mask = projected_runs >= repeat_hard_block_start
+            if torch.any(hard_mask):
+                mixed_probs[:, penalty_ids[hard_mask]] = 0.0
+
+            soft_mask = ~hard_mask
+            if torch.any(soft_mask):
+                exponents = (
+                    projected_runs[soft_mask] - repeat_penalty_start + 1
+                ).clamp_min(1)
+                penalty_scales = repeat_penalty_base ** exponents.float()
+                mixed_probs[:, penalty_ids[soft_mask]] *= penalty_scales.unsqueeze(0)
 
         if eos_id is not None:
             mixed_probs[:, eos_id] = 0.0
@@ -142,6 +254,7 @@ with torch.no_grad():
         total_prob = mixed_probs.sum(dim=-1, keepdim=True)
         if torch.any(total_prob <= 0):
             mixed_probs = probs * allowed_mask
+            mixed_probs = mixed_probs * token_run_penalty
             if eos_id is not None:
                 mixed_probs[:, eos_id] = 0.0
             total_prob = mixed_probs.sum(dim=-1, keepdim=True)
@@ -152,6 +265,12 @@ with torch.no_grad():
         entropy_values.append(entropy)
 
         next_token = torch.multinomial(mixed_probs, num_samples=1)
+        next_fragment = tokenizer.decode(
+            next_token[0].tolist(), clean_up_tokenization_spaces=False
+        )
+        last_char, last_char_run_len = update_run_state(
+            last_char, last_char_run_len, next_fragment
+        )
         input_ids = torch.cat([input_ids, next_token], dim=-1)
 
 # =========================
@@ -170,12 +289,54 @@ except UnicodeEncodeError:
 # =========================
 # 绘制 entropy 曲线
 # =========================
-plt.figure()
-plt.plot(entropy_values)
-plt.xlabel("Generation Step")
-plt.ylabel("Entropy")
-plt.title("Entropy vs Generation Step (Gradual Uniform Collapse)")
-plt.tight_layout()
-plt.savefig("entropy_curve.png", dpi=150)
+steps = np.arange(len(entropy_values))
+entropy_arr = np.asarray(entropy_values, dtype=np.float32)
+if entropy_arr.size >= 7:
+    kernel = np.ones(7, dtype=np.float32) / 7.0
+    smooth_entropy = np.convolve(entropy_arr, kernel, mode="same")
+else:
+    smooth_entropy = entropy_arr
+
+try:
+    plt.style.use("seaborn-v0_8-whitegrid")
+except OSError:
+    plt.style.use("ggplot")
+
+fig, ax = plt.subplots(figsize=(9.6, 4.8), dpi=150)
+ax.axvspan(0, collapse_warmup_steps, color="#cfe8ff", alpha=0.35, label="Warmup")
+ax.axvspan(
+    collapse_warmup_steps,
+    min(len(entropy_values), collapse_reach_steps),
+    color="#ffe0b2",
+    alpha=0.30,
+    label="Collapse ramp",
+)
+if collapse_reach_steps < len(entropy_values):
+    ax.axvspan(
+        collapse_reach_steps,
+        len(entropy_values),
+        color="#ffd6d6",
+        alpha=0.24,
+        label="Saturated collapse",
+    )
+
+ax.plot(steps, entropy_arr, color="#8aa5c2", linewidth=1.2, alpha=0.55, label="Raw entropy")
+ax.plot(
+    steps,
+    smooth_entropy,
+    color="#1f5aa6",
+    linewidth=2.4,
+    label="Smoothed entropy",
+)
+if smooth_entropy.size > 0:
+    ax.fill_between(steps, smooth_entropy, smooth_entropy.min(), color="#1f5aa6", alpha=0.10)
+
+ax.set_xlabel("Generation step")
+ax.set_ylabel("Entropy")
+ax.set_title("Entropy Trajectory Under Gradual Worst-Token Collapse", pad=10)
+ax.legend(loc="upper left", fontsize=8, frameon=True)
+ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
+fig.tight_layout()
+fig.savefig("entropy_curve.png", dpi=220, bbox_inches="tight")
 print("Saved entropy plot: entropy_curve.png")
-plt.show()
+plt.close(fig)
