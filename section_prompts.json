@@ -1,0 +1,62 @@
+{
+  "abstract": {
+    "prompt": "本文提出一种可控的生成退化框架，使语言模型从 best token prediction 平滑过渡到 worst token prediction，并系统观察其熵上升与文本崩塌过程。",
+    "max_new_tokens": 150
+  },
+  "intro": {
+    "prompt": "大语言模型通常被设计为尽量说对，而本文故意研究如何稳定地说坏这一反向问题。",
+    "max_new_tokens": 210
+  },
+  "related": {
+    "prompt": "现有研究主要关注采样温度、对抗提示与随机退化，但对从最优预测到最差预测的连续机制讨论仍较少。",
+    "max_new_tokens": 190
+  },
+  "method": {
+    "prompt": "我们将下一词分布写为模型分布与退化先验的凸组合，并通过时间调度控制退化强度。",
+    "max_new_tokens": 290
+  },
+  "problem_def": {
+    "prompt": "给定语言模型输出分布 p_t，目标是构造一条可控轨迹，使生成质量随步数增加而单调退化。",
+    "max_new_tokens": 170
+  },
+  "strategy": {
+    "prompt": "我们定义退化系数 alpha_t，并令采样分布由接近最优逐步过渡到接近最差或均匀先验。",
+    "max_new_tokens": 230
+  },
+  "entropy": {
+    "prompt": "通过预热段、非线性增长曲线和终点约束，我们可以显式控制何时开始崩塌与崩塌有多快。",
+    "max_new_tokens": 210
+  },
+  "setup": {
+    "prompt": "实验采用中文自回归模型，在固定提示词下比较不同退化调度对文本形态与熵曲线的影响。",
+    "max_new_tokens": 280
+  },
+  "impl": {
+    "prompt": "我们基于公开中文 GPT 模型实现逐步退化采样，并加入中文 token 偏置以减少英文与纯数字污染。",
+    "max_new_tokens": 220
+  },
+  "metrics": {
+    "prompt": "评价指标包含逐步熵、重复率、字符类型占比与人工可读性分级，用于联合刻画退化过程。",
+    "max_new_tokens": 200
+  },
+  "results": {
+    "prompt": "结果显示该方法能先保持可读中文，再进入语义漂移，最终到达乱码化崩塌阶段，且熵整体上升。",
+    "max_new_tokens": 210
+  },
+  "ablation": {
+    "prompt": "消融结果表明，若去掉预热或改为线性快升，模型会过早崩塌并显著缩短有效文本区间。",
+    "max_new_tokens": 170
+  },
+  "discussion": {
+    "prompt": "该框架说明错误生成同样存在可控结构，这为鲁棒性测试和安全评估提供了新视角。",
+    "max_new_tokens": 170
+  },
+  "conclusion": {
+    "prompt": "本文验证了从 best token prediction 到 worst token prediction 的连续退化路径可实现、可调速、可复现。",
+    "max_new_tokens": 130
+  },
+  "ack": {
+    "prompt": "感谢开源社区提供模型与工具支持。",
+    "max_new_tokens": 60
+  }
+}
